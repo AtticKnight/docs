@@ -1,0 +1,82 @@
+name: Verify LOCAL Atto checkout against BTCPay
+on:
+  push:
+    branches: [verify/btcpay-merchant-replay]
+permissions:
+  contents: read
+jobs:
+  checkout:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    services:
+      postgres:
+        image: postgres:18.1
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: merchant_fixture
+        ports:
+          - 127.0.0.1:55321:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 15
+    env:
+      BTCPAY_NODEFAULTCHAIN: "true"
+      TESTS_POSTGRES: "Host=127.0.0.1;Port=55321;Username=postgres;Database=btcpayserver;Include Error Detail=true"
+      ATTO_TEST_MERCHANT_DB: "Host=127.0.0.1;Port=55321;Username=postgres;Database=merchant_fixture"
+      DOTNET_NOLOGO: "true"
+      DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: btcpayserver/btcpayserver
+          ref: 2868deedd9d911b715fec7306ea9cada36d86bff
+          path: btcpay
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: attocash/integrations-n8n
+          ref: c0d99640cc1931d42bf66ef73621b82e7adfdb40
+          path: atto-fixture
+          persist-credentials: false
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.403
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Add the test payment method to the disposable BTCPay test host
+        run: |
+          cp verification/btcpay/AttoCheckoutReplayTests.cs btcpay/BTCPayServer.Tests/
+          python - <<'PY'
+          from pathlib import Path
+          p=Path("btcpay/BTCPayServer.Tests/BTCPayServerTester.cs")
+          s=p.read_text()
+          marker="services.RemoveAll<IMetadataService>();"
+          assert s.count(marker)==1
+          p.write_text(s.replace(marker,marker+"\n                            LocalAttoMethod.Register(services);"))
+          PY
+      - name: Build the BTCPay host and integration test
+        working-directory: btcpay/BTCPayServer.Tests
+        run: dotnet build -c Release /p:CI_TESTS=true /p:RazorCompileOnBuild=true --verbosity quiet
+      - name: Build the pinned Atto client and fixture
+        working-directory: atto-fixture
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+          cp ../verification/btcpay/fixture.mjs test/merchant-fixture.mjs
+      - name: Run two checkout restarts and partial payment on the local ledger
+        run: |
+          set -euo pipefail
+          node atto-fixture/test/merchant-fixture.mjs > "$RUNNER_TEMP/atto-merchant-fixture.log" 2>&1 &
+          fixture_pid=$!
+          trap 'kill -TERM "$fixture_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 120); do
+            if curl -fsS http://127.0.0.1:19345/health > "$RUNNER_TEMP/local-status"; then break; fi
+            if ! kill -0 "$fixture_pid" 2>/dev/null; then cat "$RUNNER_TEMP/atto-merchant-fixture.log"; exit 1; fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:19345/health
+          cd btcpay/BTCPayServer.Tests
+          dotnet bin/Release/net10.0/BTCPayServer.Tests.dll --filter 'AttoMerchant=AttoMerchant' --minimum-expected-tests 1 --output Detailed --show-stdout All --show-stderr Failed --ansi off
