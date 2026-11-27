@@ -217,6 +217,12 @@ public class AttoCheckoutReplayTests(ITestOutputHelper output) : UnitTestBase(ou
         async Task<string> Destination(string id) =>
             (await host.InvoiceRepository.GetInvoice(id)).GetPaymentPrompt(LocalAttoMethod.Method).Destination;
 
+        var lateInvoice = await client.CreateInvoice(user.StoreId, new CreateInvoiceRequest
+        {
+            Amount=1m, Currency="ATTO",
+            Checkout=new CreateInvoiceRequest.CheckoutOptions { Expiration=TimeSpan.FromMinutes(1) }
+        });
+
         foreach (var stopAfterBtcpayWrite in new[] { false, true })
         {
             var first = await NewInvoice();
@@ -258,7 +264,22 @@ public class AttoCheckoutReplayTests(ITestOutputHelper output) : UnitTestBase(ou
         merchant.Refresh(partial.Id);
         var observed = await AwaitInvoice(client,partial.Id,i=>i.PaidAmount==0.25m);
         Assert.NotEqual(InvoiceStatus.Settled,observed.Status);
+        Assert.Equal(InvoiceExceptionStatus.PaidPartial,observed.AdditionalStatus);
         Assert.Equal(0,await merchant.Deliver(partial.Id));
         output.WriteLine($"Partial {partialHash}: {observed.PaidAmount} of 1 ATTO, {observed.Status}/{observed.AdditionalStatus}, zero deliveries.");
+
+        var untilExpiry = lateInvoice.ExpirationTime.AddSeconds(2) - DateTimeOffset.UtcNow;
+        if (untilExpiry > TimeSpan.Zero) await Task.Delay(untilExpiry);
+        await AwaitInvoice(client, lateInvoice.Id, i=>i.Status==InvoiceStatus.Expired);
+        var lateHash = await Pay(await Destination(lateInvoice.Id),"1000000000");
+        var late = await LocalMerchant.ReadSend(lateHash);
+        Assert.Equal(lateInvoice.Id, await merchant.RecordObservation(late));
+        await merchant.SavePayment(late.Id);
+        merchant.Refresh(lateInvoice.Id);
+        var lateState = await AwaitInvoice(client,lateInvoice.Id,i=>i.AdditionalStatus==InvoiceExceptionStatus.PaidLate);
+        Assert.Equal(InvoiceStatus.Expired,lateState.Status);
+        Assert.Equal(1m,lateState.PaidAmount);
+        Assert.Equal(0,await merchant.Deliver(lateInvoice.Id));
+        output.WriteLine($"Late {lateHash}: {lateState.PaidAmount} of 1 ATTO, {lateState.Status}/{lateState.AdditionalStatus}, zero deliveries.");
     }
 }
