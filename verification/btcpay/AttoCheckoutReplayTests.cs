@@ -68,7 +68,8 @@ public sealed class LocalMerchant(BTCPayServerTester host)
         await using var db = MerchantDb();
         await db.ExecuteAsync("""
             CREATE TABLE IF NOT EXISTS checkout_seen (
-                id text PRIMARY KEY, invoice text NOT NULL, address text NOT NULL, raw numeric(20,0) NOT NULL
+                id text PRIMARY KEY, invoice text NOT NULL, address text NOT NULL, raw numeric(20,0) NOT NULL,
+                first_observed_at timestamptz NOT NULL DEFAULT clock_timestamp()
             );
             CREATE TABLE IF NOT EXISTS checkout_deliveries (
                 invoice text PRIMARY KEY, payment text NOT NULL REFERENCES checkout_seen(id)
@@ -124,6 +125,14 @@ public sealed class LocalMerchant(BTCPayServerTester host)
             """, new { send.Id, Invoice = invoice.Id, send.Address, send.Raw });
         Assert.Equal(1, matches);
         return invoice.Id;
+    }
+
+    public static async Task<DateTimeOffset> FirstObservedAt(string paymentId)
+    {
+        await using var db = MerchantDb();
+        var utc = await db.QuerySingleAsync<DateTime>(
+            "SELECT first_observed_at FROM checkout_seen WHERE id=@paymentId", new { paymentId });
+        return new DateTimeOffset(utc);
     }
 
     public async Task SavePayment(string paymentId)
@@ -217,11 +226,21 @@ public class AttoCheckoutReplayTests(ITestOutputHelper output) : UnitTestBase(ou
         async Task<string> Destination(string id) =>
             (await host.InvoiceRepository.GetInvoice(id)).GetPaymentPrompt(LocalAttoMethod.Method).Destination;
 
-        var lateInvoice = await client.CreateInvoice(user.StoreId, new CreateInvoiceRequest
+        Task<Invoice> ShortInvoice() => client.CreateInvoice(user.StoreId, new CreateInvoiceRequest
         {
             Amount=1m, Currency="ATTO",
             Checkout=new CreateInvoiceRequest.CheckoutOptions { Expiration=TimeSpan.FromMinutes(1) }
         });
+
+        var lateInvoice = await ShortInvoice();
+        var interruptedInvoice = await ShortInvoice();
+        var onTimeHash = await Pay(await Destination(interruptedInvoice.Id), "1000000000");
+        var onTimeSend = await LocalMerchant.ReadSend(onTimeHash);
+        var firstListener = new LocalMerchant(host);
+        Assert.Equal(interruptedInvoice.Id, await firstListener.RecordObservation(onTimeSend));
+        var observedBeforeExpiry = await LocalMerchant.FirstObservedAt(onTimeSend.Id);
+        Assert.True(observedBeforeExpiry < interruptedInvoice.ExpirationTime);
+        Assert.Empty((await host.InvoiceRepository.GetInvoice(interruptedInvoice.Id)).GetPayments(true));
 
         foreach (var stopAfterBtcpayWrite in new[] { false, true })
         {
@@ -268,18 +287,37 @@ public class AttoCheckoutReplayTests(ITestOutputHelper output) : UnitTestBase(ou
         Assert.Equal(0,await merchant.Deliver(partial.Id));
         output.WriteLine($"Partial {partialHash}: {observed.PaidAmount} of 1 ATTO, {observed.Status}/{observed.AdditionalStatus}, zero deliveries.");
 
-        var untilExpiry = lateInvoice.ExpirationTime.AddSeconds(2) - DateTimeOffset.UtcNow;
+        var lastExpiry = lateInvoice.ExpirationTime > interruptedInvoice.ExpirationTime
+            ? lateInvoice.ExpirationTime : interruptedInvoice.ExpirationTime;
+        var untilExpiry = lastExpiry.AddSeconds(2) - DateTimeOffset.UtcNow;
         if (untilExpiry > TimeSpan.Zero) await Task.Delay(untilExpiry);
         await AwaitInvoice(client, lateInvoice.Id, i=>i.Status==InvoiceStatus.Expired);
+        await AwaitInvoice(client, interruptedInvoice.Id, i => i.Status == InvoiceStatus.Expired);
+        var recovered = new LocalMerchant(host);
+        Assert.Equal(interruptedInvoice.Id, await recovered.RecordObservation(await LocalMerchant.ReadSend(onTimeHash)));
+        Assert.Equal(observedBeforeExpiry, await LocalMerchant.FirstObservedAt(onTimeSend.Id));
+        await recovered.SavePayment(onTimeSend.Id);
+        recovered.Refresh(interruptedInvoice.Id);
+        var recoveredState = await AwaitInvoice(client, interruptedInvoice.Id,
+            i => i.AdditionalStatus == InvoiceExceptionStatus.PaidLate);
+        Assert.Equal(InvoiceStatus.Expired, recoveredState.Status);
+        Assert.Equal(1m, recoveredState.PaidAmount);
+        Assert.Single((await host.InvoiceRepository.GetInvoice(interruptedInvoice.Id)).GetPayments(true));
+        Assert.Equal(0, await recovered.Deliver(interruptedInvoice.Id));
+        output.WriteLine($"Delayed recovery {onTimeHash}: first confirmed observation {observedBeforeExpiry:O}, expiry {interruptedInvoice.ExpirationTime:O}, recovered {recoveredState.Status}/{recoveredState.AdditionalStatus}, one stored payment, zero deliveries.");
+
         var lateHash = await Pay(await Destination(lateInvoice.Id),"1000000000");
         var late = await LocalMerchant.ReadSend(lateHash);
         Assert.Equal(lateInvoice.Id, await merchant.RecordObservation(late));
+        var observedAfterExpiry = await LocalMerchant.FirstObservedAt(late.Id);
+        Assert.True(observedAfterExpiry > lateInvoice.ExpirationTime);
         await merchant.SavePayment(late.Id);
         merchant.Refresh(lateInvoice.Id);
         var lateState = await AwaitInvoice(client,lateInvoice.Id,i=>i.AdditionalStatus==InvoiceExceptionStatus.PaidLate);
         Assert.Equal(InvoiceStatus.Expired,lateState.Status);
         Assert.Equal(1m,lateState.PaidAmount);
+        Assert.Single((await host.InvoiceRepository.GetInvoice(lateInvoice.Id)).GetPayments(true));
         Assert.Equal(0,await merchant.Deliver(lateInvoice.Id));
-        output.WriteLine($"Late {lateHash}: {lateState.PaidAmount} of 1 ATTO, {lateState.Status}/{lateState.AdditionalStatus}, zero deliveries.");
+        output.WriteLine($"Late {lateHash}: first confirmed observation {observedAfterExpiry:O}, expiry {lateInvoice.ExpirationTime:O}, {lateState.PaidAmount} of 1 ATTO, {lateState.Status}/{lateState.AdditionalStatus}, one stored payment, zero deliveries.");
     }
 }
